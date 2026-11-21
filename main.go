@@ -178,41 +178,24 @@ func main() {
 		// server. If none is running, one is started in the background first.
 		// Without -r, the target gets a server of its own.
 		if *reuse && !*wbChild {
-			wbURL := runningWorkbench()
-			if wbURL == "" {
-				if exe, err := os.Executable(); err == nil {
-					var args []string
-					for _, f := range []struct {
-						on   bool
-						flag string
-					}{{*noLSP, "-no-lsp"}, {*noGit, "-no-git"}, {*noAgent, "-no-agent"}, {*noTelemetry, "-no-telemetry"}, {*noUpdate, "-no-update"}} {
-						if f.on {
-							args = append(args, f.flag)
-						}
-					}
-					if *agentCmd != "" {
-						args = append(args, "-agent", *agentCmd)
-					}
-					flag.Visit(func(f *flag.Flag) {
-						switch f.Name {
-						case "host", "port", "base-path":
-							args = append(args, "-"+f.Name, f.Value.String())
-						}
-					})
-					wbURL = startBackgroundWorkbench(exe, args)
+			set := map[string]string{}
+			flag.Visit(func(f *flag.Flag) { set[f.Name] = f.Value.String() })
+			start := func() string {
+				exe, err := os.Executable()
+				if err != nil {
+					return ""
 				}
+				return startBackgroundWorkbench(exe, workbenchPassthrough(*noLSP, *noGit, *noAgent, *noTelemetry, *noUpdate, *agentCmd, set))
 			}
-			if wbURL != "" {
-				dest, err := handOffToWorkbench(wbURL, root, initialFile, initialLine)
-				if err == nil {
-					ui.Status("ok", "opened in the running workbench", dest, 0, os.Stdout)
-					if !*noOpen {
-						openBrowser(dest)
-					}
-					return
+			dest, err := reuseWorkbench(runningWorkbench, start, root, initialFile, initialLine)
+			if err == nil {
+				ui.Status("ok", "opened in the running workbench", dest, 0, os.Stdout)
+				if !*noOpen {
+					openBrowser(dest)
 				}
-				ui.Status("info", "workbench did not take it, starting a server instead", err.Error(), 0, os.Stderr)
+				return
 			}
+			ui.Status("info", "workbench did not take it, starting a server instead", err.Error(), 0, os.Stderr)
 		}
 	}
 
