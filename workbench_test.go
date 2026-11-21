@@ -616,3 +616,117 @@ func TestWorkbenchLockLifecycle(t *testing.T) {
 	}
 }
 
+
+func TestViewQueryKeepsOnlyFileAndLine(t *testing.T) {
+	q := url.Values{"path": {"a b/c.md"}, "line": {"7"}, "retry": {"1"}, "x": {"y"}}
+	if got, want := viewQuery(q), "line=7&path=a+b%2Fc.md"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	if got := viewQuery(url.Values{"retry": {"1"}}); got != "" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestHandOffToWorkbench(t *testing.T) {
+	newTestStore(t)
+	wb := newWorkbench("/", t.TempDir(), "", nil)
+	srv := httptest.NewServer(wb)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	dest, err := handOffToWorkbench(srv.URL+"/", dir, "docs/a.md", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := url.Parse(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Host != strings.TrimPrefix(srv.URL, "http://") || !strings.HasPrefix(u.Path, "/w/") {
+		t.Fatalf("got %s", dest)
+	}
+	if q := u.Query(); q.Get("path") != "docs/a.md" || q.Get("line") != "3" {
+		t.Fatalf("file and line lost: %s", dest)
+	}
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "/w/" + wbDirItem(resolved).ID + "/"; u.Path != want {
+		t.Fatalf("workspace %s, want %s", u.Path, want)
+	}
+
+	// Handing the same directory off again reuses its workspace.
+	again, err := handOffToWorkbench(srv.URL+"/", dir, "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(again, srv.URL+u.Path) {
+		t.Fatalf("second hand-off went elsewhere: %s", again)
+	}
+
+	if _, err := handOffToWorkbench(srv.URL+"/", filepath.Join(dir, "missing"), "", 0); err == nil {
+		t.Fatal("a target that does not exist was accepted")
+	}
+}
+
+// TestMain lets a test start this binary as a workbench, standing in for px0
+// when exercising startBackgroundWorkbench.
+func TestMain(m *testing.M) {
+	if os.Getenv("PX0_TEST_WORKBENCH") == "1" {
+		runWorkbench("127.0.0.1", 0, "/", false, false, nil)
+		return
+	}
+	os.Exit(m.Run())
+}
+
+func TestStartBackgroundWorkbench(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("PX0_TEST_WORKBENCH", "1")
+	if runningWorkbench() != "" {
+		t.Fatal("a workbench is running before the test started one")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := startBackgroundWorkbench(exe, nil)
+	b, _ := os.ReadFile(workbenchLockPath())
+	var l wbLock
+	_ = json.Unmarshal(b, &l)
+	t.Cleanup(func() {
+		if p, err := os.FindProcess(l.PID); err == nil && l.PID != 0 {
+			_ = p.Kill()
+			time.Sleep(200 * time.Millisecond) // let it release the state directory
+		}
+	})
+	if u == "" {
+		t.Fatal("no workbench came up")
+	}
+	if l.PID == 0 || l.PID == os.Getpid() || l.URL != u {
+		t.Fatalf("lock %+v does not describe the workbench at %s", l, u)
+	}
+	if got := runningWorkbench(); got != u {
+		t.Fatalf("runningWorkbench = %q, want %q", got, u)
+	}
+
+	// A target handed to it opens as one of its workspaces.
+	dest, err := handOffToWorkbench(u, t.TempDir(), "x.go", 5)
+	if err != nil || !strings.Contains(dest, "/w/") {
+		t.Fatalf("hand-off to the background workbench: %q, %v", dest, err)
+	}
+}
+
+func TestStartBackgroundWorkbenchGivesUp(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	if u := startBackgroundWorkbench(filepath.Join(t.TempDir(), "no-such-px0"), nil); u != "" {
+		t.Fatalf("got %q from a binary that does not exist", u)
+	}
+}
+
+func BenchmarkViewQuery(b *testing.B) {
+	q := url.Values{"path": {"docs/a.md"}, "line": {"7"}, "retry": {"1"}}
+	for i := 0; i < b.N; i++ {
+		viewQuery(q)
+	}
+}
