@@ -670,11 +670,15 @@ func TestHandOffToWorkbench(t *testing.T) {
 	}
 }
 
-// TestMain lets a test start this binary as a workbench, standing in for px0
-// when exercising startBackgroundWorkbench.
+// TestMain lets a test start this binary as a workbench, or as a workspace
+// that never becomes ready, standing in for px0.
 func TestMain(m *testing.M) {
 	if os.Getenv("PX0_TEST_WORKBENCH") == "1" {
 		runWorkbench("127.0.0.1", 0, "/", false, false, nil)
+		return
+	}
+	if os.Getenv("PX0_TEST_HANG") == "1" {
+		io.Copy(io.Discard, os.Stdin) // the workbench closes this to stop a workspace
 		return
 	}
 	os.Exit(m.Run())
@@ -728,5 +732,92 @@ func BenchmarkViewQuery(b *testing.B) {
 	q := url.Values{"path": {"docs/a.md"}, "line": {"7"}, "retry": {"1"}}
 	for i := 0; i < b.N; i++ {
 		viewQuery(q)
+	}
+}
+
+func TestWorkbenchPassthrough(t *testing.T) {
+	if got := workbenchPassthrough(false, false, false, false, false, "", nil); got != nil {
+		t.Fatalf("nothing given, got %v", got)
+	}
+	set := map[string]string{"port": "0", "base-path": "/x/", "host": "0.0.0.0", "no-open": "true", "r": "true"}
+	got := workbenchPassthrough(true, true, true, true, true, "claude", set)
+	want := []string{"-no-lsp", "-no-git", "-no-agent", "-no-telemetry", "-no-update",
+		"-agent", "claude", "-host", "0.0.0.0", "-port", "0", "-base-path", "/x/"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func TestReuseWorkbench(t *testing.T) {
+	newTestStore(t)
+	wb := newWorkbench("/", t.TempDir(), "", nil)
+	srv := httptest.NewServer(wb)
+	defer srv.Close()
+	root := t.TempDir()
+	never := func() string { t.Helper(); t.Fatal("started a workbench although one is running"); return "" }
+
+	// One is running: it is used and none is started.
+	dest, err := reuseWorkbench(func() string { return srv.URL + "/" }, never, root, "a.go", 2)
+	if err != nil || !strings.Contains(dest, "/w/") || !strings.Contains(dest, "path=a.go") {
+		t.Fatalf("running workbench: %q, %v", dest, err)
+	}
+
+	// None is running: one is started, once, and used.
+	started := 0
+	dest, err = reuseWorkbench(func() string { return "" }, func() string { started++; return srv.URL + "/" }, root, "", 0)
+	if err != nil || started != 1 || !strings.Contains(dest, "/w/") {
+		t.Fatalf("started workbench: %q, %v (started %d times)", dest, err, started)
+	}
+
+	// None is running and none starts: an error, so the caller serves the target itself.
+	if dest, err = reuseWorkbench(func() string { return "" }, func() string { return "" }, root, "", 0); err == nil {
+		t.Fatalf("got %q without a workbench", dest)
+	}
+
+	// The workbench is gone by the time it is called: also an error.
+	gone := httptest.NewServer(http.NotFoundHandler())
+	gone.Close()
+	if dest, err = reuseWorkbench(func() string { return gone.URL + "/" }, never, root, "", 0); err == nil {
+		t.Fatalf("got %q from a workbench that is down", dest)
+	}
+}
+
+// A workspace that is still starting shows a page that refreshes itself; the
+// file and line a hand-off asked for must survive those refreshes.
+func TestWorkbenchHoldingPageKeepsFileAndLine(t *testing.T) {
+	newTestStore(t)
+	t.Setenv("PX0_TEST_HANG", "1")
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb := newWorkbench("/", t.TempDir(), exe, nil)
+	defer wb.Close()
+	it := wbDirItem(t.TempDir())
+	if err := wb.store.Record(it); err != nil {
+		t.Fatal(err)
+	}
+
+	get := func(target string) string {
+		r := httptest.NewRequest("GET", target, nil)
+		r.Host = "127.0.0.1:7777"
+		w := httptest.NewRecorder()
+		wb.ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET %s: %d %s", target, w.Code, w.Body.String())
+		}
+		return w.Body.String()
+	}
+	base := "/w/" + it.ID + "/"
+
+	body := get(base + "?path=docs%2Fa.md&line=3&retry=&other=x")
+	if !strings.Contains(body, `http-equiv="refresh"`) || !strings.Contains(body, "url="+base+"?line=3&amp;path=docs%2Fa.md\"") {
+		t.Fatalf("refresh drops the file and line:\n%s", body)
+	}
+	if strings.Contains(body, "other=x") {
+		t.Fatal("kept a parameter that does not position the viewer")
+	}
+	if body = get(base); !strings.Contains(body, "url="+base+"\"") {
+		t.Fatalf("a plain open gained a query:\n%s", body)
 	}
 }

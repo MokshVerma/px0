@@ -1252,6 +1252,42 @@ func startBackgroundWorkbench(exe string, args []string) string {
 	return ""
 }
 
+// workbenchPassthrough returns the flags a workbench started for -r takes from
+// the command that asked for it. set holds the flags given on that command line.
+func workbenchPassthrough(noLSP, noGit, noAgent, noTelemetry, noUpdate bool, agent string, set map[string]string) []string {
+	var args []string
+	for _, f := range []struct {
+		on   bool
+		flag string
+	}{{noLSP, "-no-lsp"}, {noGit, "-no-git"}, {noAgent, "-no-agent"}, {noTelemetry, "-no-telemetry"}, {noUpdate, "-no-update"}} {
+		if f.on {
+			args = append(args, f.flag)
+		}
+	}
+	if agent != "" {
+		args = append(args, "-agent", agent)
+	}
+	for _, name := range []string{"host", "port", "base-path"} {
+		if v, ok := set[name]; ok {
+			args = append(args, "-"+name, v)
+		}
+	}
+	return args
+}
+
+// reuseWorkbench opens root in the workbench that running reports, starting
+// one with start first if none is running, and returns the page's address.
+func reuseWorkbench(running, start func() string, root, file string, line int) (string, error) {
+	u := running()
+	if u == "" {
+		u = start()
+	}
+	if u == "" {
+		return "", errors.New("no workbench is running and none could be started")
+	}
+	return handOffToWorkbench(u, root, file, line)
+}
+
 // handOffToWorkbench opens root in the workbench serving at wbURL, instead of
 // starting another server, and returns the address of its page, positioned on
 // file and line.
