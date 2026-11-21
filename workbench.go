@@ -17,6 +17,7 @@ package main
 // holds what to reopen, never live state: process IDs and ports are not saved.
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -1213,7 +1214,84 @@ func (wb *workbench) handleWorkspace(w http.ResponseWriter, r *http.Request) {
 	wb.mu.Lock()
 	progress := c.progress
 	wb.mu.Unlock()
-	wb.renderHolding(w, holdingPage{Title: itemTitle(it), Self: wb.childBase(id), Progress: progress, Starting: true})
+	// The refresh keeps the file and line a hand-off asked for.
+	self := wb.childBase(id)
+	if q := viewQuery(r.URL.Query()); q != "" {
+		self += "?" + q
+	}
+	wb.renderHolding(w, holdingPage{Title: itemTitle(it), Self: self, Progress: progress, Starting: true})
+}
+
+// viewQuery keeps only the parameters that position a workspace's viewer on a
+// file, so a holding page can refresh without dropping them.
+func viewQuery(q url.Values) string {
+	keep := url.Values{}
+	for _, k := range []string{"path", "line"} {
+		if v := q.Get(k); v != "" {
+			keep.Set(k, v)
+		}
+	}
+	return keep.Encode()
+}
+
+// startBackgroundWorkbench starts a workbench with no window or terminal of
+// its own, and waits for it to answer. It returns the workbench's URL, or ""
+// if none came up.
+func startBackgroundWorkbench(exe string, args []string) string {
+	cmd := exec.Command(exe, append([]string{"-no-open"}, args...)...)
+	detachProcess(cmd)
+	if err := cmd.Start(); err != nil {
+		return ""
+	}
+	_ = cmd.Process.Release()
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		if u := runningWorkbench(); u != "" {
+			return u
+		}
+	}
+	return ""
+}
+
+// handOffToWorkbench opens root in the workbench serving at wbURL, instead of
+// starting another server, and returns the address of its page, positioned on
+// file and line.
+func handOffToWorkbench(wbURL, root, file string, line int) (string, error) {
+	base, err := url.Parse(wbURL)
+	if err != nil {
+		return "", err
+	}
+	body, err := json.Marshal(map[string]string{"target": root})
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimSuffix(wbURL, "/")+"/api/wb/open", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	// The workbench takes writes only from its own pages (see localPost).
+	req.Header.Set("Origin", base.Scheme+"://"+base.Host)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var res struct {
+		Href  string `json:"href"`
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 16<<10)).Decode(&res); err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK || res.Href == "" {
+		if res.Error == "" {
+			res.Error = resp.Status
+		}
+		return "", errors.New(res.Error)
+	}
+	return viewerURL(base.Host, file, line, res.Href), nil
 }
 
 func withoutItem(items []wbItem, id string) []wbItem {
